@@ -812,6 +812,11 @@ textarea {
   transition: width 0.18s ease;
 }
 
+.progressFill.indeterminate {
+  width: 42%;
+  animation: progressSlide 1.05s ease-in-out infinite;
+}
+
 textarea:focus {
   border-color: rgba(105, 230, 190, 0.5);
 }
@@ -856,6 +861,20 @@ footer {
 
   to {
     transform: translateX(100%);
+  }
+}
+
+@keyframes progressSlide {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  50% {
+    transform: translateX(90%);
+  }
+
+  100% {
+    transform: translateX(240%);
   }
 }
 

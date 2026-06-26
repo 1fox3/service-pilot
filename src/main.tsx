@@ -15,6 +15,7 @@ type ServiceState = {
   path: string;
   image: string;
   version: string;
+  latest_version: string;
   user: string;
   config_path: string;
 };
@@ -28,6 +29,7 @@ type ServiceConfig = {
 
 type ServiceDetails = {
   version: string;
+  latest_version: string;
   config_path: string;
   path: string;
 };
@@ -39,13 +41,15 @@ type RefreshProgress = {
   label: string;
   current: number;
   total: number;
+  indeterminate?: boolean;
 };
 
 const idleRefreshProgress: RefreshProgress = {
   active: false,
   label: "Ready",
   current: 0,
-  total: 0
+  total: 0,
+  indeterminate: false
 };
 
 function App() {
@@ -79,15 +83,14 @@ function App() {
   async function refresh() {
     flushSync(() => {
       setLoadingServices(true);
-      setRefreshProgress({ active: true, label: "Preparing refresh", current: 0, total: 1 });
+      setRefreshProgress({ active: true, label: "Preparing refresh", current: 0, total: 0, indeterminate: true });
     });
     await nextPaint();
 
     try {
-      setRefreshProgress({ active: true, label: "Discovering services", current: 1, total: 3 });
+      setRefreshProgress({ active: true, label: "Discovering services", current: 0, total: 0, indeterminate: true });
       const serviceList = await invoke<ServiceState[]>("list_services");
       const hydratedServices = await preloadBrewDetails(serviceList, true);
-      setRefreshProgress({ active: true, label: "Applying service details", current: 3, total: 3 });
       setServices(hydratedServices);
       if (serviceList.length > 0 && !serviceList.some((service) => service.id === selectedService)) {
         const nextService = serviceList[0].id;
@@ -108,17 +111,16 @@ function App() {
     const detailsByService = new Map<string, ServiceDetails>();
 
     if (brewServices.length === 0) {
-      setRefreshProgress({ active: true, label: "No Homebrew details to load", current: 2, total: 3 });
+      setRefreshProgress({ active: true, label: "No Homebrew details to load", current: 0, total: 0, indeterminate: true });
       return serviceList;
     }
 
     for (const [index, service] of brewServices.entries()) {
-      const detailProgress = 1 + ((index + 1) / brewServices.length);
       setRefreshProgress({
         active: true,
         label: `Loading Homebrew details for ${service.name}`,
-        current: detailProgress,
-        total: 3
+        current: index,
+        total: brewServices.length
       });
 
       const cachedDetails = serviceDetailsCache.current.get(service.id);
@@ -133,13 +135,20 @@ function App() {
           setMessage(String(error));
         }
       }
+
+      setRefreshProgress({
+        active: true,
+        label: `Loaded Homebrew details for ${service.name}`,
+        current: index + 1,
+        total: brewServices.length
+      });
     }
 
     setRefreshProgress({
       active: true,
       label: "Applying service details",
-      current: 2,
-      total: 3
+      current: brewServices.length,
+      total: brewServices.length
     });
 
     return serviceList.map((service) => {
@@ -169,14 +178,26 @@ function App() {
   }
 
   async function runUpdate(service: string) {
-    setBusy(`update:${service}`);
-    setMessage(`update ${service}...`);
+    flushSync(() => {
+      setBusy(`update:${service}`);
+      setMessage(`update ${service}...`);
+      setRefreshProgress({
+        active: true,
+        label: `Updating ${service}`,
+        current: 0,
+        total: 0,
+        indeterminate: true
+      });
+    });
+    await nextPaint();
+
     try {
       await invoke("update_service", { service });
       serviceDetailsCache.current.delete(service);
       await refresh();
       setMessage(`${service} update complete`);
     } catch (error) {
+      setRefreshProgress(idleRefreshProgress);
       setMessage(String(error));
     } finally {
       setBusy(null);
@@ -356,6 +377,7 @@ function App() {
     return {
       ...service,
       version: details.version || service.version,
+      latest_version: details.latest_version || service.latest_version,
       config_path: details.config_path || service.config_path,
       path: details.path || service.path
     };
@@ -477,7 +499,7 @@ function App() {
                     <button className="headerIconButton restart" onClick={() => runAction("restart", selected.id)} disabled={busy !== null} title="Restart" aria-label="Restart service">
                       {busy === `restart:${selected.id}` ? <span className="miniSpinner" /> : <span aria-hidden="true">↻</span>}
                     </button>
-                    {selected.provider === "brew" && (
+                    {selected.provider === "brew" && hasBrewUpdate(selected) && (
                       <button className="headerIconButton update" onClick={() => runUpdate(selected.id)} disabled={busy !== null} title="Update" aria-label="Update service">
                         {busy === `update:${selected.id}` ? <span className="miniSpinner" /> : <span aria-hidden="true">⇧</span>}
                       </button>
@@ -504,7 +526,7 @@ function App() {
                         ) : null}
                       />
                       <Meta label="User" value={selected.user || "n/a"} />
-                      <Meta label="Version" value={hydratingService === selected.id && !selected.version ? "Loading..." : selected.version || "n/a"} />
+                      <Meta label="Version" value={brewVersionText(selected, hydratingService === selected.id)} />
                     </>
                   )}
                 </div>
@@ -598,6 +620,8 @@ function PageLoading({ label }: { label: string }) {
 
 function AppLoading({ progress }: { progress: RefreshProgress }) {
   const percent = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const progressWidth = `${Math.min(100, Math.max(0, percent))}%`;
+  const progressText = progress.total > 0 ? `${Math.round(progress.current)}/${Math.round(progress.total)}` : "Preparing";
 
   return (
     <div className="appLoading" aria-live="polite" aria-busy="true">
@@ -610,9 +634,9 @@ function AppLoading({ progress }: { progress: RefreshProgress }) {
           </div>
         </div>
         <div className="progressTrack">
-          <div className="progressFill" style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+          <div className={progress.indeterminate ? "progressFill indeterminate" : "progressFill"} style={progress.indeterminate ? undefined : { width: progressWidth }} />
         </div>
-        <p>{progress.total > 0 ? `${percent}%` : "Preparing"}</p>
+        <p>{progress.indeterminate ? "Working..." : progressText}</p>
       </div>
     </div>
   );
@@ -654,6 +678,23 @@ function rightPortValue(service: ServiceState) {
     return service.port_mappings.join("\n");
   }
   return servicePorts(service).length > 0 ? servicePorts(service).join(", ") : "n/a";
+}
+
+function hasBrewUpdate(service: ServiceState) {
+  return service.provider === "brew" && Boolean(service.version && service.latest_version && service.version !== service.latest_version);
+}
+
+function brewVersionText(service: ServiceState, loading: boolean) {
+  if (loading && !service.version) {
+    return "Loading...";
+  }
+  if (!service.version) {
+    return "n/a";
+  }
+  if (hasBrewUpdate(service)) {
+    return `${service.version} -> ${service.latest_version}`;
+  }
+  return service.version;
 }
 
 function providerLabel(provider: string) {

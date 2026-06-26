@@ -15,7 +15,8 @@ It currently supports Docker containers and Homebrew services.
 - Edit known Homebrew config files when a writable config path is discovered
 - Show Docker config through read-only `docker inspect`
 - Open discovered Homebrew install paths in Finder
-- Load slower Homebrew details, such as version and install path, in the background
+- Load Homebrew version, stable version, and install path during startup and Refresh All
+- Show the Homebrew update action only when the installed version differs from the stable version
 
 ## Service Providers
 
@@ -57,12 +58,14 @@ brew services info <service>
 brew upgrade <service>
 ```
 
-Homebrew details are loaded on demand:
+Homebrew details are loaded during startup and Refresh All:
 
 ```bash
 brew info --json=v2 <service>
 brew --prefix <service>
 ```
+
+When the installed version differs from the stable version, Service Pilot shows the version as `current -> stable` and displays the update button. If both versions match, the update button is hidden.
 
 Known editable config paths include common Redis, Nginx, Prometheus, Grafana, and MySQL config locations under the Homebrew prefix.
 

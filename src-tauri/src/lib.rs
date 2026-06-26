@@ -13,6 +13,7 @@ struct ServiceDefinition {
     path: Option<String>,
     image: Option<String>,
     version: Option<String>,
+    latest_version: Option<String>,
     user: Option<String>,
     config_path: Option<String>,
 }
@@ -48,6 +49,7 @@ struct ServiceState {
     path: String,
     image: String,
     version: String,
+    latest_version: String,
     user: String,
     config_path: String,
 }
@@ -63,6 +65,7 @@ struct ServiceConfig {
 #[derive(Debug, Serialize)]
 struct ServiceDetails {
     version: String,
+    latest_version: String,
     config_path: String,
     path: String,
 }
@@ -212,13 +215,18 @@ fn update_service(service: String) -> Result<(), String> {
 fn service_details(service: String) -> Result<ServiceDetails, String> {
     let service_ref = parse_service_id(&service)?;
     match service_ref.provider.as_str() {
-        "brew" => Ok(ServiceDetails {
-            version: brew_version(&service_ref.name).unwrap_or_default(),
-            config_path: brew_config_path(&service_ref.name).unwrap_or_default(),
-            path: brew_install_path(&service_ref.name).unwrap_or_default(),
-        }),
+        "brew" => {
+            let (version, latest_version) = brew_versions(&service_ref.name).unwrap_or_default();
+            Ok(ServiceDetails {
+                version,
+                latest_version,
+                config_path: brew_config_path(&service_ref.name).unwrap_or_default(),
+                path: brew_install_path(&service_ref.name).unwrap_or_default(),
+            })
+        }
         "docker" => Ok(ServiceDetails {
             version: String::new(),
+            latest_version: String::new(),
             config_path: String::new(),
             path: docker_mounts(&service_ref.name).unwrap_or_default(),
         }),
@@ -269,6 +277,7 @@ impl ServiceDefinition {
             path: self.path.unwrap_or_default(),
             image: self.image.unwrap_or_default(),
             version: self.version.unwrap_or_default(),
+            latest_version: self.latest_version.unwrap_or_default(),
             user: self.user.unwrap_or_default(),
             config_path: self.config_path.unwrap_or_default(),
         }
@@ -337,6 +346,7 @@ fn discover_docker_containers() -> Result<Vec<ServiceDefinition>, String> {
             path: Some(container.mounts),
             image: Some(container.image),
             version: None,
+            latest_version: None,
             user: None,
             config_path: None,
         });
@@ -362,6 +372,7 @@ fn discover_brew_services() -> Result<Vec<ServiceDefinition>, String> {
             path: None,
             image: None,
             version: None,
+            latest_version: None,
             user: service.user,
             config_path: service.file,
         })
@@ -403,15 +414,22 @@ fn known_brew_port(service: &str) -> Option<u16> {
     }
 }
 
-fn brew_version(service: &str) -> Option<String> {
+fn brew_versions(service: &str) -> Option<(String, String)> {
     let output = brew(&["info", "--json=v2", service]).ok()?;
     let info: BrewInfo = serde_json::from_str(&output).ok()?;
     let formula = info.formulae.first()?;
-    formula
+    let version = formula
         .installed
         .first()
         .map(|installed| installed.version.clone())
-        .or_else(|| formula.versions.stable.clone())
+        .or_else(|| formula.versions.stable.clone())?;
+    let latest_version = formula
+        .versions
+        .stable
+        .clone()
+        .unwrap_or_else(|| version.clone());
+
+    Some((version, latest_version))
 }
 
 fn homebrew_prefix() -> String {
