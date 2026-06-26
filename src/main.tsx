@@ -34,6 +34,20 @@ type ServiceDetails = {
   path: string;
 };
 
+type CustomServiceForm = {
+  id: string;
+  name: string;
+  port: string;
+  cwd: string;
+  path: string;
+  start: string;
+  stop: string;
+  restart: string;
+  status: string;
+  logs: string;
+  config: string;
+};
+
 const BASIC_SWITCH_LOADING_MS = 120;
 
 type RefreshProgress = {
@@ -50,6 +64,20 @@ const idleRefreshProgress: RefreshProgress = {
   current: 0,
   total: 0,
   indeterminate: false
+};
+
+const emptyCustomServiceForm: CustomServiceForm = {
+  id: "",
+  name: "",
+  port: "",
+  cwd: "",
+  path: "",
+  start: "",
+  stop: "",
+  restart: "",
+  status: "",
+  logs: "",
+  config: ""
 };
 
 function App() {
@@ -69,6 +97,8 @@ function App() {
   const [activePanel, setActivePanel] = useState<"config" | "logs">("config");
   const [hydratingService, setHydratingService] = useState<string | null>(null);
   const [refreshProgress, setRefreshProgress] = useState<RefreshProgress>(idleRefreshProgress);
+  const [showCustomForm, setShowCustomForm] = useState(false);
+  const [customForm, setCustomForm] = useState<CustomServiceForm>(emptyCustomServiceForm);
   const switchToken = useRef(0);
   const switchTimer = useRef<number | null>(null);
   const serviceDetailsCache = useRef(new Map<string, ServiceDetails>());
@@ -79,6 +109,11 @@ function App() {
     groups[service.provider] = [...(groups[service.provider] ?? []), service];
     return groups;
   }, {});
+  const providerOrder = ["brew", "docker", "custom"];
+  const orderedProviders = [
+    ...providerOrder.filter((provider) => groupedServices[provider]?.length),
+    ...Object.keys(groupedServices).filter((provider) => !providerOrder.includes(provider))
+  ];
 
   async function refresh() {
     flushSync(() => {
@@ -168,13 +203,25 @@ function App() {
     setMessage(`${action} ${service}...`);
     try {
       await invoke(`${action}_service`, { service });
-      await refresh();
+      await refreshServiceStatus(service);
       setMessage(`${service} ${action} complete`);
     } catch (error) {
       setMessage(String(error));
     } finally {
       setBusy(null);
     }
+  }
+
+  async function refreshServiceStatus(serviceId: string) {
+    await delay(220);
+    const status = await invoke<string>("service_status", { service: serviceId });
+    setServices((current) =>
+      current.map((service) => (service.id === serviceId ? { ...service, status } : service))
+    );
+  }
+
+  function delay(ms: number) {
+    return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
   }
 
   async function runUpdate(service: string) {
@@ -198,6 +245,26 @@ function App() {
       setMessage(`${service} update complete`);
     } catch (error) {
       setRefreshProgress(idleRefreshProgress);
+      setMessage(String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addCustomService() {
+    setBusy("add-custom");
+    try {
+      await invoke("add_custom_service", {
+        service: {
+          ...customForm,
+          port: customForm.port.trim() ? Number(customForm.port) : null
+        }
+      });
+      setShowCustomForm(false);
+      setCustomForm(emptyCustomServiceForm);
+      await refresh();
+      setMessage("Custom service added.");
+    } catch (error) {
       setMessage(String(error));
     } finally {
       setBusy(null);
@@ -403,6 +470,15 @@ function App() {
   return (
     <main className="appShell">
       {refreshProgress.active && <AppLoading progress={refreshProgress} />}
+      {showCustomForm && (
+        <CustomServiceDialog
+          form={customForm}
+          busy={busy === "add-custom"}
+          onChange={setCustomForm}
+          onClose={() => setShowCustomForm(false)}
+          onSubmit={addCustomService}
+        />
+      )}
       <aside className="sidebar">
         <div className="brand">
           <p className="eyebrow">macOS Stack</p>
@@ -414,7 +490,10 @@ function App() {
 
         <nav className="serviceMenu">
           {loadingServices && services.length === 0 && <ServiceSkeleton />}
-          {Object.entries(groupedServices).map(([provider, providerServices]) => (
+          {orderedProviders.map((provider) => {
+            const providerServices = groupedServices[provider];
+
+            return (
             <section key={provider} className="providerGroup">
               <button
                 className="providerHeader"
@@ -477,8 +556,15 @@ function App() {
                 </div>
               )}
             </section>
-          ))}
+            );
+          })}
         </nav>
+
+        <div className="sidebarFooterActions">
+          <button className="secondary wide" onClick={() => setShowCustomForm(true)} disabled={busy !== null}>
+            Add Custom
+          </button>
+        </div>
       </aside>
 
       <section className="content">
@@ -511,6 +597,12 @@ function App() {
                     <>
                       <Meta label="Image" value={selected.image || "n/a"} wide />
                       <Meta label="Port" value={rightPortValue(selected)} />
+                    </>
+                  ) : selected.provider === "custom" ? (
+                    <>
+                      <Meta label="Port" value={rightPortValue(selected)} />
+                      <Meta label="Path" value={selected.path || "n/a"} wide />
+                      <Meta label="Command" value={selected.image || "n/a"} wide />
                     </>
                   ) : (
                     <>
@@ -642,6 +734,80 @@ function AppLoading({ progress }: { progress: RefreshProgress }) {
   );
 }
 
+function CustomServiceDialog({
+  form,
+  busy,
+  onChange,
+  onClose,
+  onSubmit
+}: {
+  form: CustomServiceForm;
+  busy: boolean;
+  onChange: (form: CustomServiceForm) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  function update(field: keyof CustomServiceForm, value: string) {
+    onChange({ ...form, [field]: value });
+  }
+
+  return (
+    <div className="dialogOverlay" role="dialog" aria-modal="true" aria-labelledby="custom-service-title">
+      <section className="dialogCard">
+        <div className="dialogHeader">
+          <div>
+            <p className="eyebrow">Custom Services</p>
+            <h2 id="custom-service-title">Add Custom Service</h2>
+          </div>
+          <button className="dialogClose" onClick={onClose} disabled={busy} aria-label="Close custom service form">×</button>
+        </div>
+        <div className="formGrid">
+          <Field label="Name" value={form.name} onChange={(value) => update("name", value)} required placeholder="Python Worker" />
+          <Field label="ID" value={form.id} onChange={(value) => update("id", value)} placeholder="python-worker" />
+          <Field label="Port" value={form.port} onChange={(value) => update("port", value)} placeholder="8080" />
+          <Field label="Working Directory" value={form.cwd} onChange={(value) => update("cwd", value)} wide placeholder="/Users/me/projects/worker" />
+          <Field label="Path" value={form.path} onChange={(value) => update("path", value)} wide placeholder="/Users/me/projects/worker" />
+          <Field label="Start Command" value={form.start} onChange={(value) => update("start", value)} required wide placeholder="python worker.py" />
+          <Field label="Stop Command" value={form.stop} onChange={(value) => update("stop", value)} required wide placeholder="pkill -f worker.py" />
+          <Field label="Restart Command" value={form.restart} onChange={(value) => update("restart", value)} wide placeholder="optional" />
+          <Field label="Status Command" value={form.status} onChange={(value) => update("status", value)} wide placeholder="pgrep -f worker.py" />
+          <Field label="Logs Command" value={form.logs} onChange={(value) => update("logs", value)} wide placeholder="tail -n 160 worker.log" />
+          <Field label="Config Path" value={form.config} onChange={(value) => update("config", value)} wide placeholder="/Users/me/projects/worker/config.yaml" />
+        </div>
+        <div className="dialogActions">
+          <button onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="primary" onClick={onSubmit} disabled={busy || !form.name.trim() || !form.start.trim() || !form.stop.trim()}>
+            {busy ? <LoadingText label="Adding" /> : "Add Service"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  required = false,
+  wide = false
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  required?: boolean;
+  wide?: boolean;
+}) {
+  return (
+    <label className={wide ? "formField wideField" : "formField"}>
+      <span>{label}{required ? " *" : ""}</span>
+      <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+    </label>
+  );
+}
+
 function ServiceSkeleton() {
   return (
     <div className="skeletonGroup">
@@ -703,6 +869,9 @@ function providerLabel(provider: string) {
   }
   if (provider === "docker") {
     return "Docker Containers";
+  }
+  if (provider === "custom") {
+    return "Custom Services";
   }
   return provider;
 }

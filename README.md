@@ -2,12 +2,13 @@
 
 Service Pilot is a Tauri desktop app for discovering and controlling local macOS services from one lightweight UI.
 
-It currently supports Docker containers and Homebrew services.
+It currently supports Docker containers, Homebrew services, and user-defined custom services.
 
 ## Features
 
 - Discover Docker containers from `docker ps -a --format json`
 - Discover Homebrew services from `brew services list --json`
+- Discover custom services from `~/servicepilot/customservices/*.json`
 - Start, stop, and restart services
 - Update Homebrew services with `brew upgrade <service>`
 - View Docker logs and Homebrew service info
@@ -17,6 +18,8 @@ It currently supports Docker containers and Homebrew services.
 - Open discovered Homebrew install paths in Finder
 - Load Homebrew version, stable version, and install path during startup and Refresh All
 - Show the Homebrew update action only when the installed version differs from the stable version
+- Run user-defined start, stop, restart, status, logs, and config commands for custom services
+- Add custom command services from the UI
 
 ## Service Providers
 
@@ -69,6 +72,53 @@ When the installed version differs from the stable version, Service Pilot shows 
 
 Known editable config paths include common Redis, Nginx, Prometheus, Grafana, and MySQL config locations under the Homebrew prefix.
 
+### Custom Services
+
+Custom services are defined as one JSON file per service under:
+
+```text
+~/servicepilot/customservices/
+```
+
+Example:
+
+```json
+[
+  {
+    "id": "python-worker",
+    "name": "Python Worker",
+    "port": 8080,
+    "cwd": "/Users/me/projects/worker",
+    "path": "/Users/me/projects/worker",
+    "start": "python worker.py",
+    "stop": "pkill -f worker.py",
+    "restart": "",
+    "status": "pgrep -f worker.py",
+    "logs": "tail -n 160 worker.log",
+    "config": "/Users/me/projects/worker/config.yaml"
+  }
+]
+```
+
+Fields:
+
+- `id`: optional stable id used internally by Service Pilot. If omitted, it is derived from `name`.
+- `name`: display name.
+- `port`: optional single port.
+- `ports`: optional list of ports.
+- `cwd`: optional working directory for commands.
+- `path`: optional path opened by Finder.
+- `start`: command used by the Start action.
+- `stop`: command used by the Stop action.
+- `restart`: optional command used by Restart. If omitted or empty, Service Pilot runs `stop` and then `start`.
+- `status`: optional command. Exit code `0` means running; non-zero means stopped. If omitted, status is `unknown`.
+- `logs`: optional command used by the Logs panel.
+- `config`: optional file path loaded and saved by the Config panel.
+
+Custom commands run through `/bin/zsh -lc`.
+
+You can add a custom service from the sidebar with `Add Custom`. Service Pilot writes one JSON file per service and refreshes the service list. Custom services are displayed newest first based on each service file's creation time.
+
 ## UI Behavior
 
 - The left service list switches active state immediately after clicking another service.
@@ -82,6 +132,7 @@ Known editable config paths include common Redis, Nginx, Prometheus, Grafana, an
 - macOS
 - Docker Desktop, for Docker container discovery and control
 - Homebrew, for Homebrew service discovery and control
+- Custom service files, for user-defined command services
 - Node.js and pnpm, for frontend development
 - Rust and Cargo, for the Tauri backend
 

@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::PathBuf, process::Command, thread};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+    thread,
+};
 
 #[derive(Debug, Clone)]
 struct ServiceDefinition {
@@ -35,6 +40,37 @@ struct DockerContainer {
     image: String,
     labels: String,
     mounts: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CustomService {
+    id: Option<String>,
+    name: String,
+    port: Option<u16>,
+    ports: Option<Vec<u16>>,
+    cwd: Option<String>,
+    path: Option<String>,
+    start: String,
+    stop: String,
+    restart: Option<String>,
+    status: Option<String>,
+    logs: Option<String>,
+    config: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomServiceInput {
+    id: Option<String>,
+    name: String,
+    port: Option<u16>,
+    cwd: Option<String>,
+    path: Option<String>,
+    start: String,
+    stop: String,
+    restart: Option<String>,
+    status: Option<String>,
+    logs: Option<String>,
+    config: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,16 +145,20 @@ fn list_services() -> Result<Vec<ServiceState>, String> {
 fn read_service_config(service: String) -> Result<ServiceConfig, String> {
     let service_ref = parse_service_id(&service)?;
 
-    if service_ref.provider == "docker" {
-        let content = docker(&["inspect", &service_ref.name])?;
-        return Ok(ServiceConfig {
-            path: format!("docker inspect {}", service_ref.name),
-            content,
-            readonly: true,
-            message:
-                "Docker container configuration is shown from docker inspect and is read-only."
-                    .to_string(),
-        });
+    match service_ref.provider.as_str() {
+        "docker" => {
+            let content = docker(&["inspect", &service_ref.name])?;
+            return Ok(ServiceConfig {
+                path: format!("docker inspect {}", service_ref.name),
+                content,
+                readonly: true,
+                message:
+                    "Docker container configuration is shown from docker inspect and is read-only."
+                        .to_string(),
+            });
+        }
+        "custom" => return read_custom_service_config(&service_ref.name),
+        _ => {}
     }
 
     let Some(path) = brew_config_path(&service_ref.name) else {
@@ -144,8 +184,10 @@ fn read_service_config(service: String) -> Result<ServiceConfig, String> {
 fn save_service_config(service: String, content: String) -> Result<(), String> {
     let service_ref = parse_service_id(&service)?;
 
-    if service_ref.provider == "docker" {
-        return Err("This service config is read-only.".to_string());
+    match service_ref.provider.as_str() {
+        "docker" => return Err("This service config is read-only.".to_string()),
+        "custom" => return save_custom_service_config(&service_ref.name, content),
+        _ => {}
     }
 
     let Some(path) = brew_config_path(&service_ref.name) else {
@@ -161,6 +203,7 @@ fn start_service(service: String) -> Result<(), String> {
     match service_ref.provider.as_str() {
         "docker" => docker(&["start", &service_ref.name]).map(|_| ()),
         "brew" => brew(&["services", "start", &service_ref.name]).map(|_| ()),
+        "custom" => run_custom_start(&service_ref.name),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
 }
@@ -171,6 +214,7 @@ fn stop_service(service: String) -> Result<(), String> {
     match service_ref.provider.as_str() {
         "docker" => docker(&["stop", &service_ref.name]).map(|_| ()),
         "brew" => brew(&["services", "stop", &service_ref.name]).map(|_| ()),
+        "custom" => run_custom_stop(&service_ref.name),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
 }
@@ -181,6 +225,7 @@ fn restart_service(service: String) -> Result<(), String> {
     match service_ref.provider.as_str() {
         "docker" => docker(&["restart", &service_ref.name]).map(|_| ()),
         "brew" => brew(&["services", "restart", &service_ref.name]).map(|_| ()),
+        "custom" => run_custom_restart(&service_ref.name),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
 }
@@ -193,6 +238,7 @@ fn open_service_path(service: String) -> Result<(), String> {
         "docker" => docker_mounts(&service_ref.name)
             .ok()
             .and_then(|path| openable_path(&path)),
+        "custom" => custom_service_path(&service_ref.name),
         provider => return Err(format!("Unsupported provider: {provider}")),
     };
     let Some(path) = path else {
@@ -230,6 +276,12 @@ fn service_details(service: String) -> Result<ServiceDetails, String> {
             config_path: String::new(),
             path: docker_mounts(&service_ref.name).unwrap_or_default(),
         }),
+        "custom" => Ok(ServiceDetails {
+            version: String::new(),
+            latest_version: String::new(),
+            config_path: custom_service_config_path(&service_ref.name).unwrap_or_default(),
+            path: custom_service_path(&service_ref.name).unwrap_or_default(),
+        }),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
 }
@@ -240,8 +292,56 @@ fn service_logs(service: String) -> Result<String, String> {
     match service_ref.provider.as_str() {
         "docker" => docker(&["logs", "--tail", "160", &service_ref.name]),
         "brew" => brew(&["services", "info", &service_ref.name]),
+        "custom" => custom_service_logs(&service_ref.name),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
+}
+
+#[tauri::command]
+fn service_status(service: String) -> Result<String, String> {
+    let service_ref = parse_service_id(&service)?;
+    match service_ref.provider.as_str() {
+        "docker" => docker_status(&service_ref.name),
+        "brew" => brew_status(&service_ref.name),
+        "custom" => {
+            custom_service(&service_ref.name).map(|service| custom_service_status(&service))
+        }
+        provider => Err(format!("Unsupported provider: {provider}")),
+    }
+}
+
+#[tauri::command]
+fn add_custom_service(service: CustomServiceInput) -> Result<(), String> {
+    if service.name.trim().is_empty() {
+        return Err("Custom service name is required.".to_string());
+    }
+    if service.start.trim().is_empty() {
+        return Err("Custom service start command is required.".to_string());
+    }
+    if service.stop.trim().is_empty() {
+        return Err("Custom service stop command is required.".to_string());
+    }
+
+    let next_service = CustomService {
+        id: service.id.filter(|value| !value.trim().is_empty()),
+        name: service.name.trim().to_string(),
+        port: service.port,
+        ports: None,
+        cwd: clean_optional_string(service.cwd),
+        path: clean_optional_string(service.path),
+        start: service.start.trim().to_string(),
+        stop: service.stop.trim().to_string(),
+        restart: clean_optional_string(service.restart),
+        status: clean_optional_string(service.status),
+        logs: clean_optional_string(service.logs),
+        config: clean_optional_string(service.config),
+    };
+    let next_id = custom_service_id(&next_service);
+    if custom_service_file_path(&next_id)?.exists() {
+        return Err(format!("Custom service already exists: {next_id}"));
+    }
+
+    write_custom_service(&next_id, &next_service)
 }
 
 pub fn run() {
@@ -256,7 +356,9 @@ pub fn run() {
             open_service_path,
             update_service,
             service_details,
-            service_logs
+            service_logs,
+            service_status,
+            add_custom_service
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -295,6 +397,9 @@ fn discover_services() -> Vec<ServiceDefinition> {
         .unwrap_or_default();
     if let Some(mut brew_services) = brew_handle.join().ok().and_then(Result::ok) {
         definitions.append(&mut brew_services);
+    }
+    if let Ok(mut custom_services) = discover_custom_services() {
+        definitions.append(&mut custom_services);
     }
 
     definitions.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
@@ -379,6 +484,248 @@ fn discover_brew_services() -> Result<Vec<ServiceDefinition>, String> {
         .collect())
 }
 
+fn discover_custom_services() -> Result<Vec<ServiceDefinition>, String> {
+    Ok(read_custom_services()?
+        .into_iter()
+        .map(|service| {
+            let id = custom_service_id(&service);
+            let status = custom_service_status(&service);
+            let mut ports = service.ports.clone().unwrap_or_default();
+            if let Some(port) = service.port {
+                push_unique_port(&mut ports, port);
+            }
+
+            ServiceDefinition {
+                key: format!("custom:{id}"),
+                provider: "custom".to_string(),
+                name: service.name,
+                status,
+                ports,
+                port_mappings: Vec::new(),
+                path: service.path.or(service.cwd),
+                image: Some(service.start),
+                version: None,
+                latest_version: None,
+                user: None,
+                config_path: service.config,
+            }
+        })
+        .collect())
+}
+
+fn read_custom_services() -> Result<Vec<CustomService>, String> {
+    migrate_legacy_custom_services()?;
+
+    let dir = custom_services_config_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut services = Vec::new();
+    for entry in
+        fs::read_dir(&dir).map_err(|err| format!("Failed to read {}: {err}", dir.display()))?
+    {
+        let entry = entry.map_err(|err| format!("Failed to read custom service entry: {err}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let created_at = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.created().ok());
+        let content = fs::read_to_string(&path)
+            .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+        let service: CustomService = serde_json::from_str(&content)
+            .map_err(|err| format!("Invalid custom service JSON at {}: {err}", path.display()))?;
+        services.push((created_at, service));
+    }
+
+    services.sort_by(
+        |(left_created, left_service), (right_created, right_service)| {
+            right_created
+                .cmp(left_created)
+                .then_with(|| right_service.name.cmp(&left_service.name))
+        },
+    );
+
+    Ok(services
+        .into_iter()
+        .map(|(_created_at, service)| service)
+        .collect())
+}
+
+fn write_custom_service(id: &str, service: &CustomService) -> Result<(), String> {
+    let dir = custom_services_config_dir()?;
+    fs::create_dir_all(&dir).map_err(|err| format!("Failed to create {}: {err}", dir.display()))?;
+    let path = custom_service_file_path(id)?;
+    let content = serde_json::to_string_pretty(service)
+        .map_err(|err| format!("Failed to serialize custom service: {err}"))?;
+    fs::write(&path, content).map_err(|err| format!("Failed to write {}: {err}", path.display()))
+}
+
+fn custom_services_config_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set.".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("servicepilot")
+        .join("customservices"))
+}
+
+fn custom_service_file_path(id: &str) -> Result<PathBuf, String> {
+    Ok(custom_services_config_dir()?.join(format!("{}.json", safe_file_name(id))))
+}
+
+fn legacy_custom_services_config_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set.".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Service Pilot")
+        .join("custom-services.json"))
+}
+
+fn migrate_legacy_custom_services() -> Result<(), String> {
+    let legacy_path = legacy_custom_services_config_path()?;
+    if !legacy_path.exists() || custom_services_config_dir()?.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&legacy_path)
+        .map_err(|err| format!("Failed to read {}: {err}", legacy_path.display()))?;
+    let services: Vec<CustomService> = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "Invalid custom services JSON at {}: {err}",
+            legacy_path.display()
+        )
+    })?;
+    for service in services {
+        write_custom_service(&custom_service_id(&service), &service)?;
+    }
+    Ok(())
+}
+
+fn custom_service(id: &str) -> Result<CustomService, String> {
+    read_custom_services()?
+        .into_iter()
+        .find(|service| custom_service_id(service) == id)
+        .ok_or_else(|| format!("Custom service not found: {id}"))
+}
+
+fn custom_service_id(service: &CustomService) -> String {
+    service
+        .id
+        .clone()
+        .unwrap_or_else(|| service.name.to_lowercase().replace(' ', "-"))
+}
+
+fn clean_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn safe_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn custom_service_status(service: &CustomService) -> String {
+    let Some(status) = service.status.as_deref() else {
+        return "unknown".to_string();
+    };
+    if run_shell_status(status, service.cwd.as_deref()).unwrap_or(false) {
+        "running".to_string()
+    } else {
+        "stopped".to_string()
+    }
+}
+
+fn run_custom_start(id: &str) -> Result<(), String> {
+    let service = custom_service(id)?;
+    spawn_shell_command(&service.start, service.cwd.as_deref())
+}
+
+fn run_custom_stop(id: &str) -> Result<(), String> {
+    let service = custom_service(id)?;
+    run_shell_command(&service.stop, service.cwd.as_deref()).map(|_| ())
+}
+
+fn run_custom_restart(id: &str) -> Result<(), String> {
+    let service = custom_service(id)?;
+    if let Some(restart) = service
+        .restart
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+    {
+        return run_shell_command(restart, service.cwd.as_deref()).map(|_| ());
+    }
+
+    run_shell_command(&service.stop, service.cwd.as_deref())?;
+    spawn_shell_command(&service.start, service.cwd.as_deref())
+}
+
+fn custom_service_logs(id: &str) -> Result<String, String> {
+    let service = custom_service(id)?;
+    if let Some(logs) = service
+        .logs
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+    {
+        return run_shell_command(logs, service.cwd.as_deref());
+    }
+    serde_json::to_string_pretty(&service)
+        .map_err(|err| format!("Failed to render custom service definition: {err}"))
+}
+
+fn read_custom_service_config(id: &str) -> Result<ServiceConfig, String> {
+    let service = custom_service(id)?;
+    let Some(path) = service.config else {
+        let content = serde_json::to_string_pretty(&service)
+            .map_err(|err| format!("Failed to render custom service definition: {err}"))?;
+        return Ok(ServiceConfig {
+            path: custom_services_config_dir()?.display().to_string(),
+            content,
+            readonly: true,
+            message: "No config path was configured for this custom service.".to_string(),
+        });
+    };
+
+    let content =
+        fs::read_to_string(&path).map_err(|err| format!("Failed to read {path}: {err}"))?;
+    Ok(ServiceConfig {
+        path,
+        content,
+        readonly: false,
+        message: "Config file loaded.".to_string(),
+    })
+}
+
+fn save_custom_service_config(id: &str, content: String) -> Result<(), String> {
+    let service = custom_service(id)?;
+    let Some(path) = service.config else {
+        return Err("No config path was configured for this custom service.".to_string());
+    };
+    fs::write(&path, content).map_err(|err| format!("Failed to write {path}: {err}"))
+}
+
+fn custom_service_config_path(id: &str) -> Option<String> {
+    custom_service(id).ok().and_then(|service| service.config)
+}
+
+fn custom_service_path(id: &str) -> Option<String> {
+    custom_service(id)
+        .ok()
+        .and_then(|service| service.path.or(service.cwd))
+}
+
 fn brew_config_path(service: &str) -> Option<String> {
     let homebrew_prefix = homebrew_prefix();
     let candidates = match service {
@@ -432,6 +779,15 @@ fn brew_versions(service: &str) -> Option<(String, String)> {
     Some((version, latest_version))
 }
 
+fn brew_status(service: &str) -> Result<String, String> {
+    let services = discover_brew_services()?;
+    services
+        .into_iter()
+        .find(|definition| definition.key == format!("brew:{service}"))
+        .map(|definition| definition.status)
+        .ok_or_else(|| format!("Homebrew service not found: {service}"))
+}
+
 fn homebrew_prefix() -> String {
     std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".to_string())
 }
@@ -442,6 +798,17 @@ fn brew(args: &[&str]) -> Result<String, String> {
 
 fn docker(args: &[&str]) -> Result<String, String> {
     command("docker", args)
+}
+
+fn docker_status(container: &str) -> Result<String, String> {
+    let status = docker(&["inspect", "--format", "{{.State.Status}}", container])?
+        .trim()
+        .to_string();
+    if status.is_empty() {
+        Err(format!("Docker container status is empty: {container}"))
+    } else {
+        Ok(status)
+    }
 }
 
 fn parse_service_id(service: &str) -> Result<ServiceRef, String> {
@@ -630,6 +997,63 @@ fn command(program: &str, args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn run_shell_command(command_text: &str, cwd: Option<&str>) -> Result<String, String> {
+    let mut command = Command::new("/bin/zsh");
+    command.arg("-lc").arg(command_text);
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        command.current_dir(cwd);
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to run custom command: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else if stderr.is_empty() {
+        Err(format!("Custom command failed: {command_text}"))
+    } else {
+        Err(stderr)
+    }
+}
+
+fn spawn_shell_command(command_text: &str, cwd: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new("/bin/zsh");
+    command
+        .arg("-lc")
+        .arg(command_text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        command.current_dir(cwd);
+    }
+
+    command
+        .spawn()
+        .map_err(|err| format!("Failed to start custom command: {err}"))?;
+    Ok(())
+}
+
+fn run_shell_status(command_text: &str, cwd: Option<&str>) -> Result<bool, String> {
+    let mut command = Command::new("/bin/zsh");
+    command
+        .arg("-lc")
+        .arg(command_text)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        command.current_dir(cwd);
+    }
+
+    let status = command
+        .status()
+        .map_err(|err| format!("Failed to run custom status command: {err}"))?;
+    Ok(status.success())
 }
 
 fn openable_path(path: &str) -> Option<String> {

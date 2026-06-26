@@ -34,6 +34,21 @@ textarea {
   font: inherit;
 }
 
+input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 11px;
+  padding: 10px 11px;
+  color: #e8edf8;
+  background: rgba(3, 8, 16, 0.62);
+  font: inherit;
+  outline: none;
+}
+
+input:focus {
+  border-color: rgba(105, 230, 190, 0.5);
+}
+
 button:hover:not(:disabled) {
   border-color: rgba(107, 151, 255, 0.8);
   background: rgba(107, 151, 255, 0.14);
@@ -123,6 +138,14 @@ h2 {
   font-weight: 800;
 }
 
+.secondary {
+  margin-top: 8px;
+  border-color: rgba(145, 177, 255, 0.24);
+  color: #dce6ff;
+  background: rgba(145, 177, 255, 0.1);
+  font-weight: 800;
+}
+
 .wide {
   width: 100%;
 }
@@ -140,6 +163,12 @@ h2 {
 
 .serviceMenu::-webkit-scrollbar {
   display: none;
+}
+
+.sidebarFooterActions {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .skeletonGroup {
@@ -815,6 +844,73 @@ textarea {
 .progressFill.indeterminate {
   width: 42%;
   animation: progressSlide 1.05s ease-in-out infinite;
+}
+
+.dialogOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(8, 17, 31, 0.74);
+  backdrop-filter: blur(10px);
+}
+
+.dialogCard {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 44px);
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 24px;
+  padding: 20px;
+  background: rgba(13, 24, 43, 0.96);
+  box-shadow: 0 24px 90px rgba(0, 0, 0, 0.38);
+}
+
+.dialogHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.dialogHeader h2 {
+  margin-bottom: 0;
+}
+
+.dialogClose {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.formGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.formField {
+  display: grid;
+  gap: 6px;
+  color: #aeb9cd;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.wideField {
+  grid-column: 1 / -1;
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
 }
 
 textarea:focus {
