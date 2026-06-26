@@ -749,6 +749,69 @@ textarea {
   gap: 12px;
 }
 
+.appLoading {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(8, 17, 31, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.appLoadingCard {
+  width: min(420px, 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 22px;
+  padding: 20px;
+  color: #e8edf8;
+  background: rgba(13, 24, 43, 0.92);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+}
+
+.appLoadingTitle {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  margin-bottom: 16px;
+}
+
+.appLoadingTitle strong,
+.appLoadingTitle span {
+  display: block;
+}
+
+.appLoadingTitle strong {
+  margin-bottom: 4px;
+  font-size: 15px;
+}
+
+.appLoadingTitle span,
+.appLoadingCard p {
+  color: #aeb9cd;
+  font-size: 13px;
+}
+
+.appLoadingCard p {
+  margin: 8px 0 0;
+  text-align: right;
+}
+
+.progressTrack {
+  overflow: hidden;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.progressFill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #69e6be, #91b1ff);
+  transition: width 0.18s ease;
+}
+
 textarea:focus {
   border-color: rgba(105, 230, 190, 0.5);
 }

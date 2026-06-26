@@ -34,6 +34,20 @@ type ServiceDetails = {
 
 const BASIC_SWITCH_LOADING_MS = 120;
 
+type RefreshProgress = {
+  active: boolean;
+  label: string;
+  current: number;
+  total: number;
+};
+
+const idleRefreshProgress: RefreshProgress = {
+  active: false,
+  label: "Ready",
+  current: 0,
+  total: 0
+};
+
 function App() {
   const [services, setServices] = useState<ServiceState[]>([]);
   const [selectedService, setSelectedService] = useState("");
@@ -50,8 +64,10 @@ function App() {
   const [collapsedProviders, setCollapsedProviders] = useState<Record<string, boolean>>({});
   const [activePanel, setActivePanel] = useState<"config" | "logs">("config");
   const [hydratingService, setHydratingService] = useState<string | null>(null);
+  const [refreshProgress, setRefreshProgress] = useState<RefreshProgress>(idleRefreshProgress);
   const switchToken = useRef(0);
   const switchTimer = useRef<number | null>(null);
+  const serviceDetailsCache = useRef(new Map<string, ServiceDetails>());
 
   const selected = services.find((service) => service.id === selectedService) ?? services[0];
   const activeServiceId = activeService || selectedService || selected?.id;
@@ -61,20 +77,81 @@ function App() {
   }, {});
 
   async function refresh() {
-    setLoadingServices(true);
+    flushSync(() => {
+      setLoadingServices(true);
+      setRefreshProgress({ active: true, label: "Preparing refresh", current: 0, total: 1 });
+    });
+    await nextPaint();
+
     try {
+      setRefreshProgress({ active: true, label: "Discovering services", current: 1, total: 3 });
       const serviceList = await invoke<ServiceState[]>("list_services");
-      setServices(serviceList);
+      const hydratedServices = await preloadBrewDetails(serviceList, true);
+      setRefreshProgress({ active: true, label: "Applying service details", current: 3, total: 3 });
+      setServices(hydratedServices);
       if (serviceList.length > 0 && !serviceList.some((service) => service.id === selectedService)) {
         const nextService = serviceList[0].id;
         setSelectedService(nextService);
         setActiveService(nextService);
         loadConfigForService(nextService);
-        loadServiceDetails(nextService, serviceList.find((service) => service.id === nextService));
       }
     } finally {
-      setLoadingServices(false);
+      window.setTimeout(() => {
+        setLoadingServices(false);
+        setRefreshProgress(idleRefreshProgress);
+      }, 120);
     }
+  }
+
+  async function preloadBrewDetails(serviceList: ServiceState[], forceRefresh = false) {
+    const brewServices = serviceList.filter((service) => service.provider === "brew");
+    const detailsByService = new Map<string, ServiceDetails>();
+
+    if (brewServices.length === 0) {
+      setRefreshProgress({ active: true, label: "No Homebrew details to load", current: 2, total: 3 });
+      return serviceList;
+    }
+
+    for (const [index, service] of brewServices.entries()) {
+      const detailProgress = 1 + ((index + 1) / brewServices.length);
+      setRefreshProgress({
+        active: true,
+        label: `Loading Homebrew details for ${service.name}`,
+        current: detailProgress,
+        total: 3
+      });
+
+      const cachedDetails = serviceDetailsCache.current.get(service.id);
+      if (cachedDetails && !forceRefresh) {
+        detailsByService.set(service.id, cachedDetails);
+      } else {
+        try {
+          const details = await invoke<ServiceDetails>("service_details", { service: service.id });
+          serviceDetailsCache.current.set(service.id, details);
+          detailsByService.set(service.id, details);
+        } catch (error) {
+          setMessage(String(error));
+        }
+      }
+    }
+
+    setRefreshProgress({
+      active: true,
+      label: "Applying service details",
+      current: 2,
+      total: 3
+    });
+
+    return serviceList.map((service) => {
+      const details = detailsByService.get(service.id);
+      return details ? applyServiceDetails(service, details) : service;
+    });
+  }
+
+  function nextPaint() {
+    return new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
   }
 
   async function runAction(action: "start" | "stop" | "restart", service: string) {
@@ -96,6 +173,7 @@ function App() {
     setMessage(`update ${service}...`);
     try {
       await invoke("update_service", { service });
+      serviceDetailsCache.current.delete(service);
       await refresh();
       setMessage(`${service} update complete`);
     } catch (error) {
@@ -213,12 +291,20 @@ function App() {
       return;
     }
 
+    const cachedDetails = serviceDetailsCache.current.get(serviceId);
+    if (cachedDetails) {
+      mergeServiceDetails(serviceId, cachedDetails);
+      setHydratingService((current) => (current === serviceId ? null : current));
+      return;
+    }
+
     setHydratingService(serviceId);
     try {
       const details = await invoke<ServiceDetails>("service_details", { service: serviceId });
       if (switchToken.current !== token) {
         return;
       }
+      serviceDetailsCache.current.set(serviceId, details);
       mergeServiceDetails(serviceId, details);
     } catch (error) {
       if (switchToken.current !== token) {
@@ -261,16 +347,18 @@ function App() {
   function mergeServiceDetails(serviceId: string, details: ServiceDetails) {
     setServices((current) =>
       current.map((service) =>
-        service.id === serviceId
-          ? {
-              ...service,
-              version: details.version || service.version,
-              config_path: details.config_path || service.config_path,
-              path: details.path || service.path
-            }
-          : service
+        service.id === serviceId ? applyServiceDetails(service, details) : service
       )
     );
+  }
+
+  function applyServiceDetails(service: ServiceState, details: ServiceDetails) {
+    return {
+      ...service,
+      version: details.version || service.version,
+      config_path: details.config_path || service.config_path,
+      path: details.path || service.path
+    };
   }
 
   function toggleProvider(provider: string) {
@@ -292,6 +380,7 @@ function App() {
 
   return (
     <main className="appShell">
+      {refreshProgress.active && <AppLoading progress={refreshProgress} />}
       <aside className="sidebar">
         <div className="brand">
           <p className="eyebrow">macOS Stack</p>
@@ -502,6 +591,28 @@ function PageLoading({ label }: { label: string }) {
       <div className="pageLoadingCard">
         <span className="spinner" />
         <span>{label}</span>
+      </div>
+    </div>
+  );
+}
+
+function AppLoading({ progress }: { progress: RefreshProgress }) {
+  const percent = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+  return (
+    <div className="appLoading" aria-live="polite" aria-busy="true">
+      <div className="appLoadingCard">
+        <div className="appLoadingTitle">
+          <span className="spinner" />
+          <div>
+            <strong>Loading services</strong>
+            <span>{progress.label}</span>
+          </div>
+        </div>
+        <div className="progressTrack">
+          <div className="progressFill" style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+        </div>
+        <p>{progress.total > 0 ? `${percent}%` : "Preparing"}</p>
       </div>
     </div>
   );
