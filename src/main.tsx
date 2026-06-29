@@ -102,6 +102,9 @@ function App() {
   const switchToken = useRef(0);
   const switchTimer = useRef<number | null>(null);
   const serviceDetailsCache = useRef(new Map<string, ServiceDetails>());
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const didInitialRefresh = useRef(false);
+  const detailsLoadToken = useRef(0);
 
   const selected = services.find((service) => service.id === selectedService) ?? services[0];
   const activeServiceId = activeService || selectedService || selected?.id;
@@ -115,7 +118,24 @@ function App() {
     ...Object.keys(groupedServices).filter((provider) => !providerOrder.includes(provider))
   ];
 
-  async function refresh() {
+  function refresh() {
+    if (refreshInFlight.current) {
+      return refreshInFlight.current;
+    }
+
+    const task = runRefresh().finally(() => {
+      if (refreshInFlight.current === task) {
+        refreshInFlight.current = null;
+      }
+    });
+    refreshInFlight.current = task;
+    return task;
+  }
+
+  async function runRefresh() {
+    const detailsToken = detailsLoadToken.current + 1;
+    detailsLoadToken.current = detailsToken;
+
     flushSync(() => {
       setLoadingServices(true);
       setRefreshProgress({ active: true, label: "Preparing refresh", current: 0, total: 0, indeterminate: true });
@@ -125,14 +145,15 @@ function App() {
     try {
       setRefreshProgress({ active: true, label: "Discovering services", current: 0, total: 0, indeterminate: true });
       const serviceList = await invoke<ServiceState[]>("list_services");
-      const hydratedServices = await preloadBrewDetails(serviceList, true);
-      setServices(hydratedServices);
+      setServices(serviceList);
       if (serviceList.length > 0 && !serviceList.some((service) => service.id === selectedService)) {
         const nextService = serviceList[0].id;
         setSelectedService(nextService);
         setActiveService(nextService);
         loadConfigForService(nextService);
       }
+
+      preloadBrewDetails(serviceList, detailsToken, true).catch((error) => setMessage(String(error)));
     } finally {
       window.setTimeout(() => {
         setLoadingServices(false);
@@ -141,55 +162,52 @@ function App() {
     }
   }
 
-  async function preloadBrewDetails(serviceList: ServiceState[], forceRefresh = false) {
+  async function preloadBrewDetails(serviceList: ServiceState[], token: number, forceRefresh = false) {
     const brewServices = serviceList.filter((service) => service.provider === "brew");
-    const detailsByService = new Map<string, ServiceDetails>();
 
     if (brewServices.length === 0) {
-      setRefreshProgress({ active: true, label: "No Homebrew details to load", current: 0, total: 0, indeterminate: true });
-      return serviceList;
+      return;
     }
 
-    for (const [index, service] of brewServices.entries()) {
-      setRefreshProgress({
-        active: true,
-        label: `Loading Homebrew details for ${service.name}`,
-        current: index,
-        total: brewServices.length
-      });
+    let completed = 0;
+    const pendingServices = [...brewServices];
+    const workerCount = Math.min(3, pendingServices.length);
+    setMessage(`Loading Homebrew details 0/${brewServices.length}...`);
 
-      const cachedDetails = serviceDetailsCache.current.get(service.id);
-      if (cachedDetails && !forceRefresh) {
-        detailsByService.set(service.id, cachedDetails);
-      } else {
+    async function loadNextService() {
+      while (pendingServices.length > 0) {
+        const service = pendingServices.shift();
+        if (!service || detailsLoadToken.current !== token) {
+          return;
+        }
+
+        const cachedDetails = serviceDetailsCache.current.get(service.id);
         try {
-          const details = await invoke<ServiceDetails>("service_details", { service: service.id });
+          const details = cachedDetails && !forceRefresh
+            ? cachedDetails
+            : await invoke<ServiceDetails>("service_details", { service: service.id });
+          if (detailsLoadToken.current !== token) {
+            return;
+          }
           serviceDetailsCache.current.set(service.id, details);
-          detailsByService.set(service.id, details);
+          mergeServiceDetails(service.id, details);
         } catch (error) {
-          setMessage(String(error));
+          if (detailsLoadToken.current === token) {
+            setMessage(String(error));
+          }
+        }
+
+        completed += 1;
+        if (detailsLoadToken.current === token) {
+          setMessage(`Loading Homebrew details ${completed}/${brewServices.length}...`);
         }
       }
-
-      setRefreshProgress({
-        active: true,
-        label: `Loaded Homebrew details for ${service.name}`,
-        current: index + 1,
-        total: brewServices.length
-      });
     }
 
-    setRefreshProgress({
-      active: true,
-      label: "Applying service details",
-      current: brewServices.length,
-      total: brewServices.length
-    });
-
-    return serviceList.map((service) => {
-      const details = detailsByService.get(service.id);
-      return details ? applyServiceDetails(service, details) : service;
-    });
+    await Promise.all(Array.from({ length: workerCount }, loadNextService));
+    if (detailsLoadToken.current === token) {
+      setMessage("Homebrew details loaded.");
+    }
   }
 
   function nextPaint() {
@@ -458,6 +476,11 @@ function App() {
   }
 
   useEffect(() => {
+    if (didInitialRefresh.current) {
+      return;
+    }
+
+    didInitialRefresh.current = true;
     refresh().catch((error) => setMessage(String(error)));
 
     return () => {
