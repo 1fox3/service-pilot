@@ -1,14 +1,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::Instant,
 };
 
 const PERF_PREFIX: &str = "[ServicePilot:perf]";
+
+static BREW_DETAILS_CACHE: OnceLock<Mutex<HashMap<String, ServiceDetails>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ServiceDefinition {
@@ -101,7 +105,7 @@ struct ServiceConfig {
     message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ServiceDetails {
     version: String,
     latest_version: String,
@@ -282,13 +286,11 @@ fn service_details(service: String) -> Result<ServiceDetails, String> {
     let service_ref = parse_service_id(&service)?;
     match service_ref.provider.as_str() {
         "brew" => {
-            let (version, latest_version) = brew_versions(&service_ref.name).unwrap_or_default();
-            Ok(ServiceDetails {
-                version,
-                latest_version,
-                config_path: brew_config_path(&service_ref.name).unwrap_or_default(),
-                path: brew_install_path(&service_ref.name).unwrap_or_default(),
-            })
+            if let Some(details) = cached_brew_details(&service_ref.name) {
+                return Ok(details);
+            }
+
+            Ok(load_brew_details(&service_ref.name))
         }
         "docker" => Ok(ServiceDetails {
             version: String::new(),
@@ -304,6 +306,29 @@ fn service_details(service: String) -> Result<ServiceDetails, String> {
         }),
         provider => Err(format!("Unsupported provider: {provider}")),
     }
+}
+
+#[tauri::command]
+fn warm_brew_details(services: Vec<String>) {
+    thread::spawn(move || {
+        let start = Instant::now();
+        for service in services {
+            let Ok(service_ref) = parse_service_id(&service) else {
+                continue;
+            };
+            if service_ref.provider != "brew" || cached_brew_details(&service_ref.name).is_some() {
+                continue;
+            }
+
+            let service_start = Instant::now();
+            load_brew_details(&service_ref.name);
+            log_perf(
+                &format!("warm_brew_details:{}", service_ref.name),
+                service_start,
+            );
+        }
+        log_perf("warm_brew_details:total", start);
+    });
 }
 
 #[tauri::command]
@@ -382,6 +407,7 @@ pub fn run() {
             open_service_path,
             update_service,
             service_details,
+            warm_brew_details,
             service_logs,
             service_status,
             add_custom_service,
@@ -784,6 +810,36 @@ fn brew_install_path(service: &str) -> Option<String> {
         .ok()
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty())
+}
+
+fn load_brew_details(service: &str) -> ServiceDetails {
+    if let Some(details) = cached_brew_details(service) {
+        return details;
+    }
+
+    let (version, latest_version) = brew_versions(service).unwrap_or_default();
+    let details = ServiceDetails {
+        version,
+        latest_version,
+        config_path: brew_config_path(service).unwrap_or_default(),
+        path: brew_install_path(service).unwrap_or_default(),
+    };
+    store_brew_details(service, details.clone());
+    details
+}
+
+fn cached_brew_details(service: &str) -> Option<ServiceDetails> {
+    brew_details_cache().lock().ok()?.get(service).cloned()
+}
+
+fn store_brew_details(service: &str, details: ServiceDetails) {
+    if let Ok(mut cache) = brew_details_cache().lock() {
+        cache.insert(service.to_string(), details);
+    }
+}
+
+fn brew_details_cache() -> &'static Mutex<HashMap<String, ServiceDetails>> {
+    BREW_DETAILS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn known_brew_port(service: &str) -> Option<u16> {

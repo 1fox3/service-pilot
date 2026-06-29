@@ -246,12 +246,18 @@ function App() {
       const serviceList = combineProviderServices(discoveredServicesByProvider.current);
       setServices(serviceList);
       setMessage("Loaded Homebrew.");
+      timedInvoke("warm_brew_details", { services: brewServices.map((service) => service.id) })
+        .catch((error) => setMessage(String(error)));
       loadSelectedBrewDetails(serviceList, detailsToken);
     }).catch((error) => setMessage(String(error)));
   }
 
   function loadSelectedBrewDetails(serviceList: ServiceState[], token: number) {
-    const selectedId = selectedService || activeService || serviceList[0]?.id;
+    const selectedId = selectedService || activeService;
+    if (!selectedId) {
+      return;
+    }
+
     const service = serviceList.find((service) => service.id === selectedId);
     if (service?.provider !== "brew") {
       return;
