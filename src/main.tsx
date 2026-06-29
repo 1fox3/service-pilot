@@ -49,6 +49,7 @@ type CustomServiceForm = {
 };
 
 const BASIC_SWITCH_LOADING_MS = 120;
+const PERF_PREFIX = "[ServicePilot:perf]";
 
 type RefreshProgress = {
   active: boolean;
@@ -80,6 +81,34 @@ const emptyCustomServiceForm: CustomServiceForm = {
   config: ""
 };
 
+async function timedOperation<T>(label: string, operation: () => Promise<T>) {
+  const start = performance.now();
+  logPerf(`${label} started`);
+  try {
+    const result = await operation();
+    logPerf(`${label} finished in ${formatDuration(performance.now() - start)}`);
+    return result;
+  } catch (error) {
+    logPerf(`${label} failed in ${formatDuration(performance.now() - start)}`);
+    throw error;
+  }
+}
+
+function timedInvoke<T>(command: string, args?: Record<string, unknown>) {
+  return timedOperation(`invoke:${command}`, () => invoke<T>(command, args));
+}
+
+function formatDuration(ms: number) {
+  return `${Math.round(ms)}ms`;
+}
+
+function logPerf(message: string) {
+  console.log(`${PERF_PREFIX} ${message}`);
+  invoke("record_perf", { message }).catch(() => {
+    // Ignore logging failures so performance instrumentation cannot break user actions.
+  });
+}
+
 function App() {
   const [services, setServices] = useState<ServiceState[]>([]);
   const [selectedService, setSelectedService] = useState("");
@@ -105,6 +134,7 @@ function App() {
   const refreshInFlight = useRef<Promise<void> | null>(null);
   const didInitialRefresh = useRef(false);
   const detailsLoadToken = useRef(0);
+  const discoveredServicesByProvider = useRef(new Map<string, ServiceState[]>());
 
   const selected = services.find((service) => service.id === selectedService) ?? services[0];
   const activeServiceId = activeService || selectedService || selected?.id;
@@ -123,7 +153,7 @@ function App() {
       return refreshInFlight.current;
     }
 
-    const task = runRefresh().finally(() => {
+    const task = timedOperation("refresh", runRefresh).finally(() => {
       if (refreshInFlight.current === task) {
         refreshInFlight.current = null;
       }
@@ -136,24 +166,44 @@ function App() {
     const detailsToken = detailsLoadToken.current + 1;
     detailsLoadToken.current = detailsToken;
 
+    const preparingStart = performance.now();
+    logPerf("preparingRefresh started");
+    const flushStart = performance.now();
     flushSync(() => {
       setLoadingServices(true);
       setRefreshProgress({ active: true, label: "Preparing refresh", current: 0, total: 0, indeterminate: true });
     });
+    logPerf(`preparingRefresh:flushSync finished in ${formatDuration(performance.now() - flushStart)}`);
+    const paintStart = performance.now();
     await nextPaint();
+    logPerf(`preparingRefresh:nextPaint finished in ${formatDuration(performance.now() - paintStart)}`);
+    logPerf(`preparingRefresh finished in ${formatDuration(performance.now() - preparingStart)}`);
 
     try {
-      setRefreshProgress({ active: true, label: "Discovering services", current: 0, total: 0, indeterminate: true });
-      const serviceList = await invoke<ServiceState[]>("list_services");
-      setServices(serviceList);
+      const discoveringProgressStart = performance.now();
+      logPerf("discoveringServicesProgress started");
+      const discoveringFlushStart = performance.now();
+      flushSync(() => {
+        setRefreshProgress({ active: true, label: "Discovering services", current: 0, total: 0, indeterminate: true });
+      });
+      logPerf(`discoveringServicesProgress:flushSync finished in ${formatDuration(performance.now() - discoveringFlushStart)}`);
+      const discoveringPaintStart = performance.now();
+      await nextPaint();
+      logPerf(`discoveringServicesProgress:nextPaint finished in ${formatDuration(performance.now() - discoveringPaintStart)}`);
+      logPerf(`discoveringServicesProgress finished in ${formatDuration(performance.now() - discoveringProgressStart)}`);
+
+      const serviceList = await discoverFastServices(detailsToken);
       if (serviceList.length > 0 && !serviceList.some((service) => service.id === selectedService)) {
         const nextService = serviceList[0].id;
         setSelectedService(nextService);
         setActiveService(nextService);
-        loadConfigForService(nextService);
+        await loadConfigForService(nextService);
+      } else if (selectedService) {
+        await loadConfigForService(selectedService);
       }
 
-      preloadBrewDetails(serviceList, detailsToken, true).catch((error) => setMessage(String(error)));
+      discoverBrewServicesInBackground(detailsToken);
+
     } finally {
       window.setTimeout(() => {
         setLoadingServices(false);
@@ -162,52 +212,63 @@ function App() {
     }
   }
 
-  async function preloadBrewDetails(serviceList: ServiceState[], token: number, forceRefresh = false) {
-    const brewServices = serviceList.filter((service) => service.provider === "brew");
+  async function discoverFastServices(detailsToken: number) {
+    discoveredServicesByProvider.current = new Map();
+    const providers = ["docker", "custom"];
+    const results = await Promise.all(providers.map(async (provider) => {
+      try {
+        const providerServices = await timedInvoke<ServiceState[]>("list_provider_services", { provider });
+        if (detailsLoadToken.current !== detailsToken) {
+          return [];
+        }
+        discoveredServicesByProvider.current.set(provider, providerServices);
+        setServices(combineProviderServices(discoveredServicesByProvider.current));
+        setMessage(`Loaded ${providerLabel(provider)}.`);
+        return providerServices;
+      } catch (error) {
+        if (detailsLoadToken.current === detailsToken) {
+          setMessage(String(error));
+        }
+        return [];
+      }
+    }));
 
-    if (brewServices.length === 0) {
+    return sortServices(results.flat());
+  }
+
+  function discoverBrewServicesInBackground(detailsToken: number) {
+    timedOperation("discoverBrewServices", async () => {
+      const brewServices = await timedInvoke<ServiceState[]>("list_provider_services", { provider: "brew" });
+      if (detailsLoadToken.current !== detailsToken) {
+        return;
+      }
+      discoveredServicesByProvider.current.set("brew", brewServices);
+      const serviceList = combineProviderServices(discoveredServicesByProvider.current);
+      setServices(serviceList);
+      setMessage("Loaded Homebrew.");
+      loadSelectedBrewDetails(serviceList, detailsToken);
+    }).catch((error) => setMessage(String(error)));
+  }
+
+  function loadSelectedBrewDetails(serviceList: ServiceState[], token: number) {
+    const selectedId = selectedService || activeService || serviceList[0]?.id;
+    const service = serviceList.find((service) => service.id === selectedId);
+    if (service?.provider !== "brew") {
       return;
     }
 
-    let completed = 0;
-    const pendingServices = [...brewServices];
-    const workerCount = Math.min(3, pendingServices.length);
-    setMessage(`Loading Homebrew details 0/${brewServices.length}...`);
+    timedOperation(`selectedBrewDetails:${service.id}`, () => loadServiceDetails(service.id, service, token))
+      .catch((error) => setMessage(String(error)));
+  }
 
-    async function loadNextService() {
-      while (pendingServices.length > 0) {
-        const service = pendingServices.shift();
-        if (!service || detailsLoadToken.current !== token) {
-          return;
-        }
+  function combineProviderServices(servicesByProvider: Map<string, ServiceState[]>) {
+    return sortServices(Array.from(servicesByProvider.values()).flat());
+  }
 
-        const cachedDetails = serviceDetailsCache.current.get(service.id);
-        try {
-          const details = cachedDetails && !forceRefresh
-            ? cachedDetails
-            : await invoke<ServiceDetails>("service_details", { service: service.id });
-          if (detailsLoadToken.current !== token) {
-            return;
-          }
-          serviceDetailsCache.current.set(service.id, details);
-          mergeServiceDetails(service.id, details);
-        } catch (error) {
-          if (detailsLoadToken.current === token) {
-            setMessage(String(error));
-          }
-        }
-
-        completed += 1;
-        if (detailsLoadToken.current === token) {
-          setMessage(`Loading Homebrew details ${completed}/${brewServices.length}...`);
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: workerCount }, loadNextService));
-    if (detailsLoadToken.current === token) {
-      setMessage("Homebrew details loaded.");
-    }
+  function sortServices(serviceList: ServiceState[]) {
+    return [...serviceList].sort((left, right) =>
+      left.provider.localeCompare(right.provider) || left.name.localeCompare(right.name)
+    );
   }
 
   function nextPaint() {
@@ -217,11 +278,14 @@ function App() {
   }
 
   async function runAction(action: "start" | "stop" | "restart", service: string) {
+    const operationLabel = `action:${action}:${service}`;
     setBusy(`${action}:${service}`);
     setMessage(`${action} ${service}...`);
     try {
-      await invoke(`${action}_service`, { service });
-      await refreshServiceStatus(service);
+      await timedOperation(operationLabel, async () => {
+        await timedInvoke(`${action}_service`, { service });
+        await refreshServiceStatus(service);
+      });
       setMessage(`${service} ${action} complete`);
     } catch (error) {
       setMessage(String(error));
@@ -231,11 +295,13 @@ function App() {
   }
 
   async function refreshServiceStatus(serviceId: string) {
-    await delay(220);
-    const status = await invoke<string>("service_status", { service: serviceId });
-    setServices((current) =>
-      current.map((service) => (service.id === serviceId ? { ...service, status } : service))
-    );
+    await timedOperation(`refreshServiceStatus:${serviceId}`, async () => {
+      await delay(220);
+      const status = await timedInvoke<string>("service_status", { service: serviceId });
+      setServices((current) =>
+        current.map((service) => (service.id === serviceId ? { ...service, status } : service))
+      );
+    });
   }
 
   function delay(ms: number) {
@@ -257,9 +323,11 @@ function App() {
     await nextPaint();
 
     try {
-      await invoke("update_service", { service });
-      serviceDetailsCache.current.delete(service);
-      await refresh();
+      await timedOperation(`update:${service}`, async () => {
+        await timedInvoke("update_service", { service });
+        serviceDetailsCache.current.delete(service);
+        await refresh();
+      });
       setMessage(`${service} update complete`);
     } catch (error) {
       setRefreshProgress(idleRefreshProgress);
@@ -272,15 +340,17 @@ function App() {
   async function addCustomService() {
     setBusy("add-custom");
     try {
-      await invoke("add_custom_service", {
-        service: {
-          ...customForm,
-          port: customForm.port.trim() ? Number(customForm.port) : null
-        }
+      await timedOperation("addCustomService", async () => {
+        await timedInvoke("add_custom_service", {
+          service: {
+            ...customForm,
+            port: customForm.port.trim() ? Number(customForm.port) : null
+          }
+        });
+        setShowCustomForm(false);
+        setCustomForm(emptyCustomServiceForm);
+        await refresh();
       });
-      setShowCustomForm(false);
-      setCustomForm(emptyCustomServiceForm);
-      await refresh();
       setMessage("Custom service added.");
     } catch (error) {
       setMessage(String(error));
@@ -292,7 +362,7 @@ function App() {
   async function openServicePath(service: string) {
     setBusy(`open:${service}`);
     try {
-      await invoke("open_service_path", { service });
+      await timedOperation(`openServicePath:${service}`, () => timedInvoke("open_service_path", { service }));
       setMessage("Opened service folder in Finder.");
     } catch (error) {
       setMessage(String(error));
@@ -311,7 +381,7 @@ function App() {
     setActiveService(service);
     setSelectedService(service);
     try {
-      const output = await invoke<string>("service_logs", { service });
+      const output = await timedOperation(`loadLogs:${service}`, () => timedInvoke<string>("service_logs", { service }));
       setLogs(output || "No logs yet.");
       setMessage(`Loaded service info for ${service}`);
     } catch (error) {
@@ -339,9 +409,11 @@ function App() {
     setBusy(`save-config:${selected.id}`);
     setLoadingConfig(true);
     try {
-      await invoke("save_service_config", { service: selected.id, content: configContent });
-      setMessage("Config saved. Restart the service to apply changes if needed.");
-      await loadConfig(selected.id);
+      await timedOperation(`saveConfig:${selected.id}`, async () => {
+        await timedInvoke("save_service_config", { service: selected.id, content: configContent });
+        setMessage("Config saved. Restart the service to apply changes if needed.");
+        await loadConfig(selected.id);
+      });
     } catch (error) {
       setMessage(String(error));
     } finally {
@@ -380,12 +452,14 @@ function App() {
       setHydratingService(service?.provider === "brew" ? serviceId : null);
       setLoadingServiceSwitch(false);
       switchTimer.current = null;
-      loadConfigForService(serviceId, token);
+      timedOperation(`selectService:${serviceId}`, () => loadConfigForService(serviceId, token))
+        .catch((error) => setMessage(String(error)));
 
       if (service?.provider === "brew") {
         window.setTimeout(() => {
           if (switchToken.current === token) {
-            loadServiceDetails(serviceId, service, token);
+            timedOperation(`selectServiceDetails:${serviceId}`, () => loadServiceDetails(serviceId, service, token))
+              .catch((error) => setMessage(String(error)));
           }
         }, 0);
       }
@@ -406,7 +480,7 @@ function App() {
 
     setHydratingService(serviceId);
     try {
-      const details = await invoke<ServiceDetails>("service_details", { service: serviceId });
+      const details = await timedInvoke<ServiceDetails>("service_details", { service: serviceId });
       if (switchToken.current !== token) {
         return;
       }
@@ -428,7 +502,7 @@ function App() {
     setBusy(`config:${service}`);
     setLoadingConfig(true);
     try {
-      const nextConfig = await invoke<ServiceConfig>("read_service_config", { service });
+      const nextConfig = await timedOperation(`loadConfig:${service}`, () => timedInvoke<ServiceConfig>("read_service_config", { service }));
       if (switchToken.current !== token) {
         return;
       }

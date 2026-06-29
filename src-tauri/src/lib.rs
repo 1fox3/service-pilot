@@ -5,7 +5,10 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     thread,
+    time::Instant,
 };
+
+const PERF_PREFIX: &str = "[ServicePilot:perf]";
 
 #[derive(Debug, Clone)]
 struct ServiceDefinition {
@@ -136,6 +139,23 @@ struct BrewVersions {
 #[tauri::command]
 fn list_services() -> Result<Vec<ServiceState>, String> {
     Ok(discover_services()
+        .into_iter()
+        .map(|service| service.into_state())
+        .collect())
+}
+
+#[tauri::command]
+fn list_provider_services(provider: String) -> Result<Vec<ServiceState>, String> {
+    let start = Instant::now();
+    let services = match provider.as_str() {
+        "docker" => discover_docker_containers(),
+        "brew" => discover_brew_services(),
+        "custom" => discover_custom_services(),
+        provider => Err(format!("Unsupported provider: {provider}")),
+    }?;
+    log_perf(&format!("list_provider_services:{provider}"), start);
+
+    Ok(services
         .into_iter()
         .map(|service| service.into_state())
         .collect())
@@ -344,10 +364,16 @@ fn add_custom_service(service: CustomServiceInput) -> Result<(), String> {
     write_custom_service(&next_id, &next_service)
 }
 
+#[tauri::command]
+fn record_perf(message: String) {
+    eprintln!("{PERF_PREFIX} frontend:{message}");
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_services,
+            list_provider_services,
             read_service_config,
             save_service_config,
             start_service,
@@ -358,7 +384,8 @@ pub fn run() {
             service_details,
             service_logs,
             service_status,
-            add_custom_service
+            add_custom_service,
+            record_perf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -387,22 +414,32 @@ impl ServiceDefinition {
 }
 
 fn discover_services() -> Vec<ServiceDefinition> {
+    let start = Instant::now();
     let docker_handle = thread::spawn(discover_docker_containers);
     let brew_handle = thread::spawn(discover_brew_services);
 
+    let docker_join_start = Instant::now();
     let mut definitions = docker_handle
         .join()
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
+    log_perf("discover_services:docker_join", docker_join_start);
+
+    let brew_join_start = Instant::now();
     if let Some(mut brew_services) = brew_handle.join().ok().and_then(Result::ok) {
         definitions.append(&mut brew_services);
     }
+    log_perf("discover_services:brew_join", brew_join_start);
+
+    let custom_start = Instant::now();
     if let Ok(mut custom_services) = discover_custom_services() {
         definitions.append(&mut custom_services);
     }
+    log_perf("discover_services:custom", custom_start);
 
     definitions.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
+    log_perf("discover_services:total", start);
     definitions
 }
 
@@ -987,10 +1024,12 @@ fn push_unique_mapping(mappings: &mut Vec<String>, mapping: String) {
 }
 
 fn command(program: &str, args: &[&str]) -> Result<String, String> {
+    let start = Instant::now();
     let output = Command::new(program)
         .args(args)
         .output()
         .map_err(|err| format!("Failed to run {program}: {err}"))?;
+    log_perf(&format!("command:{} {}", program, args.join(" ")), start);
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -1000,6 +1039,7 @@ fn command(program: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn run_shell_command(command_text: &str, cwd: Option<&str>) -> Result<String, String> {
+    let start = Instant::now();
     let mut command = Command::new("/bin/zsh");
     command.arg("-lc").arg(command_text);
     if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
@@ -1009,6 +1049,7 @@ fn run_shell_command(command_text: &str, cwd: Option<&str>) -> Result<String, St
     let output = command
         .output()
         .map_err(|err| format!("Failed to run custom command: {err}"))?;
+    log_perf(&format!("shell:{}", command_text), start);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -1022,6 +1063,7 @@ fn run_shell_command(command_text: &str, cwd: Option<&str>) -> Result<String, St
 }
 
 fn spawn_shell_command(command_text: &str, cwd: Option<&str>) -> Result<(), String> {
+    let start = Instant::now();
     let mut command = Command::new("/bin/zsh");
     command
         .arg("-lc")
@@ -1036,10 +1078,12 @@ fn spawn_shell_command(command_text: &str, cwd: Option<&str>) -> Result<(), Stri
     command
         .spawn()
         .map_err(|err| format!("Failed to start custom command: {err}"))?;
+    log_perf(&format!("spawn_shell:{}", command_text), start);
     Ok(())
 }
 
 fn run_shell_status(command_text: &str, cwd: Option<&str>) -> Result<bool, String> {
+    let start = Instant::now();
     let mut command = Command::new("/bin/zsh");
     command
         .arg("-lc")
@@ -1053,7 +1097,15 @@ fn run_shell_status(command_text: &str, cwd: Option<&str>) -> Result<bool, Strin
     let status = command
         .status()
         .map_err(|err| format!("Failed to run custom status command: {err}"))?;
+    log_perf(&format!("shell_status:{}", command_text), start);
     Ok(status.success())
+}
+
+fn log_perf(label: &str, start: Instant) {
+    eprintln!(
+        "{PERF_PREFIX} {label} finished in {}ms",
+        start.elapsed().as_millis()
+    );
 }
 
 fn openable_path(path: &str) -> Option<String> {
